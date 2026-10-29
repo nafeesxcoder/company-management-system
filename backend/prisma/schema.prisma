@@ -1,0 +1,821 @@
+// Company Income, Project & Financial Management System
+// Database: MySQL 8  |  ORM: Prisma  |  Migrations: Prisma Migrate
+//
+// MONEY RULES (enforced by this schema + the service layer):
+//   * All monetary columns are DECIMAL(18,4). Never Float/Double.
+//   * Every monetary row stores its ISO-4217 currency code.
+//   * Cross-currency aggregation must go through the ExchangeRate table.
+//   * All timestamps are stored in UTC; display timezone is a user/company setting.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  runtime  = "nodejs"
+  // Emit ".js" import specifiers. Without this the generated client imports
+  // "./internal/class.ts", which TypeScript leaves untouched and Node then
+  // cannot resolve in the compiled output.
+  importFileExtension = "js"
+}
+
+// Prisma 7: the connection URL lives in prisma.config.ts (for Migrate) and is
+// supplied to PrismaClient at runtime through the MariaDB driver adapter,
+// which speaks the MySQL protocol and connects to MySQL 8.
+datasource db {
+  provider = "mysql"
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum MembershipRole {
+  OWNER // full control, billing, integrations, roles
+  ADMIN // everything except transferring ownership
+  PARTNER // read everything, write financial records
+  VIEWER // read-only
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+}
+
+enum ProjectType {
+  SAAS
+  WEB_APPLICATION
+  MOBILE_APPLICATION
+  CLIENT_WEBSITE
+  CUSTOM_SOFTWARE
+  OTHER
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  PAUSED
+  COMPLETED
+  ARCHIVED
+}
+
+enum RevenueModel {
+  MONTHLY_SUBSCRIPTION
+  ANNUAL_SUBSCRIPTION
+  ONE_TIME_PAYMENT
+  IN_APP_PURCHASE
+  ADVERTISING
+  CLIENT_MILESTONE
+  MANUAL_BANK_TRANSFER
+  OTHER
+}
+
+enum PaymentProvider {
+  STRIPE
+  RAZORPAY
+  GOOGLE_PLAY
+  MANUAL_BANK
+  OTHER
+}
+
+enum TransactionType {
+  ONE_TIME_PAYMENT
+  SUBSCRIPTION_INITIAL
+  SUBSCRIPTION_RENEWAL
+  IN_APP_PURCHASE
+  MILESTONE_PAYMENT
+  MANUAL_ENTRY
+  ADVERTISING_PAYOUT
+  OTHER
+}
+
+/// Only SUCCEEDED / PARTIALLY_REFUNDED count as received revenue.
+/// PENDING is tracked as an outstanding receivable. FAILED is excluded entirely.
+enum TransactionStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  DISPUTED
+}
+
+enum RecordSource {
+  AUTOMATED // ingested from a verified provider webhook
+  MANUAL // entered by a company member
+  IMPORTED // bulk CSV / reconciliation import
+}
+
+/// Set when a payment could not be mapped to a project with confidence.
+enum ReviewStatus {
+  NOT_REQUIRED
+  NEEDS_REVIEW
+  RESOLVED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  PAUSED
+  CANCELED
+  EXPIRED
+}
+
+enum BillingInterval {
+  DAILY
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  SEMI_ANNUAL
+  ANNUAL
+  CUSTOM
+}
+
+enum ExpensePaymentStatus {
+  PENDING
+  PAID
+  OVERDUE
+  CANCELED
+}
+
+enum PayoutStatus {
+  PENDING
+  PAID
+  CANCELED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+  NEEDS_REVIEW
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  PARTIALLY_PAID
+  VOID
+  OVERDUE
+}
+
+enum NotificationType {
+  PAYMENT_RECEIVED
+  PAYMENT_FAILED
+  REFUND_PROCESSED
+  WEBHOOK_NEEDS_REVIEW
+  SUBSCRIPTION_CANCELED
+  PAYOUT_RECORDED
+  MEMBER_INVITED
+  SYSTEM
+}
+
+// ---------------------------------------------------------------------------
+// IDENTITY & ACCESS
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(uuid()) @db.Char(36)
+  email        String    @unique @db.VarChar(255)
+  passwordHash String    @db.VarChar(255)
+  fullName     String    @db.VarChar(160)
+  avatarUrl    String?   @db.VarChar(512)
+  timezone     String    @default("Asia/Kolkata") @db.VarChar(64)
+  locale       String    @default("en-IN") @db.VarChar(16)
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+
+  // Password reset (hashed token only — never store the raw token)
+  resetTokenHash      String?   @db.VarChar(128)
+  resetTokenExpiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships         CompanyMembership[]
+  refreshTokens       RefreshToken[]
+  invitesSent         CompanyMembership[] @relation("MembershipInvitedBy")
+  auditLogs           AuditLog[]
+  profitShares        PartnerProfitShare[] @relation("ProfitShareUser")
+  profitSharesCreated PartnerProfitShare[] @relation("ProfitShareCreatedBy")
+  payoutsReceived     PartnerPayout[]      @relation("PayoutPartner")
+  payoutsCreated      PartnerPayout[]      @relation("PayoutCreatedBy")
+  transactionsCreated Transaction[]        @relation("TransactionCreatedBy")
+  refundsCreated      Refund[]             @relation("RefundCreatedBy")
+  expensesCreated     Expense[]            @relation("ExpenseCreatedBy")
+  projectsCreated     Project[]            @relation("ProjectCreatedBy")
+  notifications       Notification[]
+
+  @@index([isActive])
+  @@map("users")
+}
+
+model RefreshToken {
+  id     String @id @default(uuid()) @db.Char(36)
+  userId String @db.Char(36)
+
+  /// SHA-256 of the raw refresh token. The raw token never touches the database.
+  tokenHash String @unique @db.Char(64)
+
+  /// Rotation family. Reuse of a revoked token revokes the whole family.
+  familyId String @db.Char(36)
+
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  replacedByTokenHash String?   @db.Char(64)
+  userAgent           String?   @db.VarChar(255)
+  ipAddress           String?   @db.VarChar(64)
+  createdAt           DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// COMPANY
+// ---------------------------------------------------------------------------
+
+model Company {
+  id           String  @id @default(uuid()) @db.Char(36)
+  name         String  @db.VarChar(160)
+  legalName    String? @db.VarChar(200)
+  /// Reporting currency. All cross-currency figures convert into this.
+  baseCurrency String  @default("INR") @db.Char(3)
+  timezone     String  @default("Asia/Kolkata") @db.VarChar(64)
+  fiscalYearStartMonth Int @default(4) @db.TinyInt // India FY starts in April
+  logoUrl      String? @db.VarChar(512)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships       CompanyMembership[]
+  projects          Project[]
+  providerAccounts  PaymentProviderAccount[]
+  transactions      Transaction[]
+  subscriptions     Subscription[]
+  expenses          Expense[]
+  expenseCategories ExpenseCategory[]
+  profitShares      PartnerProfitShare[]
+  payouts           PartnerPayout[]
+  auditLogs         AuditLog[]
+  invoices          Invoice[]
+  notifications     Notification[]
+  exchangeRates     ExchangeRate[]
+
+  @@map("companies")
+}
+
+model CompanyMembership {
+  id        String           @id @default(uuid()) @db.Char(36)
+  companyId String           @db.Char(36)
+  userId    String           @db.Char(36)
+  role      MembershipRole   @default(PARTNER)
+  status    MembershipStatus @default(ACTIVE)
+
+  invitedById String?   @db.Char(36)
+  invitedAt   DateTime?
+  joinedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  invitedBy User?   @relation("MembershipInvitedBy", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, userId])
+  @@index([userId])
+  @@index([companyId, role])
+  @@map("company_memberships")
+}
+
+// ---------------------------------------------------------------------------
+// PROJECTS
+// ---------------------------------------------------------------------------
+
+model Project {
+  id        String @id @default(uuid()) @db.Char(36)
+  companyId String @db.Char(36)
+
+  /// Human-readable stable identifier, unique within the company (e.g. "DESTINY-ONE").
+  code String @db.VarChar(40)
+
+  name          String        @db.VarChar(160)
+  description   String?       @db.Text
+  type          ProjectType   @default(OTHER)
+  status        ProjectStatus @default(ACTIVE)
+  revenueModel  RevenueModel  @default(OTHER)
+  /// Default currency for records created against this project.
+  currency      String        @default("INR") @db.Char(3)
+  projectUrl    String?       @db.VarChar(512)
+  repositoryUrl String?       @db.VarChar(512)
+  launchDate    DateTime?     @db.Date
+  notes         String?       @db.Text
+
+  archivedAt  DateTime?
+  createdById String?   @db.Char(36)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company          Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy        User?                    @relation("ProjectCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  transactions     Transaction[]
+  subscriptions    Subscription[]
+  expenses         Expense[]
+  invoices         Invoice[]
+  productMappings  ProviderProductMapping[]
+
+  @@unique([companyId, code])
+  @@index([companyId, status])
+  @@index([companyId, type])
+  @@map("projects")
+}
+
+// ---------------------------------------------------------------------------
+// PAYMENT PROVIDERS & INGESTION
+// ---------------------------------------------------------------------------
+
+model PaymentProviderAccount {
+  id        String          @id @default(uuid()) @db.Char(36)
+  companyId String          @db.Char(36)
+  provider  PaymentProvider
+  /// Display label, e.g. "Stripe – US entity".
+  label     String          @db.VarChar(120)
+
+  /// Provider-side account identifier (Stripe acct_…, Razorpay merchant id, Play package).
+  externalAccountId String? @db.VarChar(191)
+
+  /// Secrets are AES-256-GCM encrypted at rest with APP_ENCRYPTION_KEY.
+  /// They are NEVER returned by the API and never reach the browser or mobile app.
+  apiKeyCiphertext        String? @db.Text
+  webhookSecretCiphertext String? @db.Text
+
+  isActive Boolean @default(true)
+  /// Set true only after a signed end-to-end webhook test has succeeded.
+  isVerified          Boolean   @default(false)
+  lastWebhookAt       DateTime?
+  verificationTestedAt DateTime?
+
+  settings Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company         Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactions    Transaction[]
+  subscriptions   Subscription[]
+  webhookEvents   WebhookEvent[]
+  productMappings ProviderProductMapping[]
+
+  @@unique([companyId, provider, label])
+  @@index([companyId, provider])
+  @@map("payment_provider_accounts")
+}
+
+/// Trusted server-side mapping from a provider-side product/price/plan/SKU to a project.
+/// This is how an incoming payment is attributed to a project. Nothing is attributed
+/// from client-supplied metadata alone.
+model ProviderProductMapping {
+  id                String          @id @default(uuid()) @db.Char(36)
+  providerAccountId String          @db.Char(36)
+  provider          PaymentProvider
+  projectId         String          @db.Char(36)
+
+  /// price_… / plan_… / SKU / product id as the provider reports it.
+  externalProductId String  @db.VarChar(191)
+  label             String? @db.VarChar(160)
+  isActive          Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  providerAccount PaymentProviderAccount @relation(fields: [providerAccountId], references: [id], onDelete: Cascade)
+  project         Project                @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([providerAccountId, externalProductId])
+  @@index([projectId])
+  @@map("provider_product_mappings")
+}
+
+model WebhookEvent {
+  id                String          @id @default(uuid()) @db.Char(36)
+  providerAccountId String?         @db.Char(36)
+  provider          PaymentProvider
+
+  /// Provider event id — the idempotency key. Duplicate deliveries are no-ops.
+  externalEventId String @db.VarChar(191)
+  eventType       String @db.VarChar(120)
+
+  signatureValid Boolean       @default(false)
+  status         WebhookStatus @default(RECEIVED)
+  attempts       Int           @default(0)
+  lastError      String?       @db.Text
+  payload        Json
+  receivedAt     DateTime      @default(now())
+  processedAt    DateTime?
+  nextRetryAt    DateTime?
+
+  providerAccount PaymentProviderAccount? @relation(fields: [providerAccountId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, externalEventId])
+  @@index([status, nextRetryAt])
+  @@index([providerAccountId, receivedAt])
+  @@map("webhook_events")
+}
+
+// ---------------------------------------------------------------------------
+// MONEY IN
+// ---------------------------------------------------------------------------
+
+model Transaction {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String  @db.Char(36)
+  /// Null only while the payment is awaiting manual attribution (reviewStatus = NEEDS_REVIEW).
+  projectId String? @db.Char(36)
+
+  providerAccountId String?         @db.Char(36)
+  provider          PaymentProvider @default(MANUAL_BANK)
+  subscriptionId    String?         @db.Char(36)
+
+  /// Provider-side payment/charge id. Unique per provider — the ingestion idempotency key.
+  externalTransactionId String? @db.VarChar(191)
+
+  type   TransactionType   @default(ONE_TIME_PAYMENT)
+  status TransactionStatus @default(SUCCEEDED)
+
+  /// What the customer paid.
+  grossAmount    Decimal @db.Decimal(18, 4)
+  /// Provider processing fee. Deducted exactly once, at this row.
+  feeAmount      Decimal @default(0) @db.Decimal(18, 4)
+  /// Running total of settled refunds against this transaction (maintained in a DB transaction).
+  refundedAmount Decimal @default(0) @db.Decimal(18, 4)
+  currency       String  @db.Char(3)
+
+  /// Snapshot of the rate to company base currency at the time of the payment.
+  /// Null when currency == company.baseCurrency.
+  exchangeRateToBase Decimal? @db.Decimal(18, 8)
+
+  customerReference String? @db.VarChar(191)
+  description       String? @db.VarChar(500)
+  invoiceId         String? @db.Char(36)
+
+  source       RecordSource @default(MANUAL)
+  reviewStatus ReviewStatus @default(NOT_REQUIRED)
+  reviewNote   String?      @db.VarChar(500)
+
+  occurredAt  DateTime
+  settledAt   DateTime?
+  createdById String?   @db.Char(36)
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company         Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project         Project?                @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  providerAccount PaymentProviderAccount? @relation(fields: [providerAccountId], references: [id], onDelete: SetNull)
+  subscription    Subscription?           @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  invoice         Invoice?                @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  createdBy       User?                   @relation("TransactionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  refunds         Refund[]
+
+  @@unique([provider, externalTransactionId])
+  @@index([companyId, occurredAt])
+  @@index([companyId, status, occurredAt])
+  @@index([projectId, occurredAt])
+  @@index([companyId, reviewStatus])
+  @@index([subscriptionId])
+  @@map("transactions")
+}
+
+model Refund {
+  id            String @id @default(uuid()) @db.Char(36)
+  transactionId String @db.Char(36)
+
+  provider         PaymentProvider
+  externalRefundId String?         @db.VarChar(191)
+
+  amount       Decimal      @db.Decimal(18, 4)
+  /// Portion of the original provider fee returned (often 0 — fees are usually not refunded).
+  feeRefunded  Decimal      @default(0) @db.Decimal(18, 4)
+  currency     String       @db.Char(3)
+  status       RefundStatus @default(SUCCEEDED)
+  isPartial    Boolean      @default(false)
+  reason       String?      @db.VarChar(500)
+  source       RecordSource @default(MANUAL)
+
+  occurredAt  DateTime
+  createdById String?  @db.Char(36)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  createdBy   User?       @relation("RefundCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@unique([provider, externalRefundId])
+  @@index([transactionId])
+  @@index([occurredAt])
+  @@map("refunds")
+}
+
+model Subscription {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String  @db.Char(36)
+  projectId String? @db.Char(36)
+
+  providerAccountId String?         @db.Char(36)
+  provider          PaymentProvider
+
+  externalSubscriptionId String? @db.VarChar(191)
+  customerReference      String? @db.VarChar(191)
+  planCode               String? @db.VarChar(120)
+
+  amount   Decimal         @db.Decimal(18, 4)
+  currency String          @db.Char(3)
+  interval BillingInterval @default(MONTHLY)
+
+  status SubscriptionStatus @default(ACTIVE)
+
+  startedAt          DateTime
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  canceledAt         DateTime?
+  endedAt            DateTime?
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company         Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project         Project?                @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  providerAccount PaymentProviderAccount? @relation(fields: [providerAccountId], references: [id], onDelete: SetNull)
+  transactions    Transaction[]
+
+  @@unique([provider, externalSubscriptionId])
+  @@index([companyId, status])
+  @@index([projectId])
+  @@map("subscriptions")
+}
+
+model Invoice {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String  @db.Char(36)
+  projectId String? @db.Char(36)
+
+  number            String        @db.VarChar(60)
+  customerReference String?       @db.VarChar(191)
+  customerName      String?       @db.VarChar(191)
+  amount            Decimal       @db.Decimal(18, 4)
+  amountPaid        Decimal       @default(0) @db.Decimal(18, 4)
+  currency          String        @db.Char(3)
+  status            InvoiceStatus @default(DRAFT)
+  issuedAt          DateTime?
+  dueAt             DateTime?
+  notes             String?       @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company      Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project      Project?      @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  transactions Transaction[]
+
+  @@unique([companyId, number])
+  @@index([companyId, status])
+  @@map("invoices")
+}
+
+// ---------------------------------------------------------------------------
+// MONEY OUT
+// ---------------------------------------------------------------------------
+
+model ExpenseCategory {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String  @db.Char(36)
+  name      String  @db.VarChar(120)
+  slug      String  @db.VarChar(120)
+  color     String? @db.VarChar(16)
+  /// Seeded defaults cannot be deleted, only renamed.
+  isSystem  Boolean @default(false)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  expenses Expense[]
+
+  @@unique([companyId, slug])
+  @@index([companyId, isActive])
+  @@map("expense_categories")
+}
+
+model Expense {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String  @db.Char(36)
+  /// Null = company-wide overhead (allocated across all projects in reports).
+  projectId String? @db.Char(36)
+  categoryId String @db.Char(36)
+
+  vendor      String  @db.VarChar(160)
+  description String? @db.VarChar(500)
+
+  amount   Decimal @db.Decimal(18, 4)
+  taxAmount Decimal @default(0) @db.Decimal(18, 4)
+  currency String  @db.Char(3)
+
+  exchangeRateToBase Decimal? @db.Decimal(18, 8)
+
+  expenseDate   DateTime             @db.Date
+  paymentStatus ExpensePaymentStatus @default(PAID)
+  paidAt        DateTime?
+
+  receiptUrl String? @db.VarChar(512)
+  notes      String? @db.Text
+
+  /// When true the row is recorded but excluded from Net Profit
+  /// (e.g. a capital transfer, or a provider fee already deducted on the transaction).
+  excludeFromProfit Boolean @default(false)
+
+  isRecurring     Boolean          @default(false)
+  recurringInterval BillingInterval?
+
+  source      RecordSource @default(MANUAL)
+  createdById String?      @db.Char(36)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company   Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project   Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  category  ExpenseCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  createdBy User?           @relation("ExpenseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([companyId, expenseDate])
+  @@index([companyId, paymentStatus])
+  @@index([projectId, expenseDate])
+  @@index([categoryId])
+  @@map("expenses")
+}
+
+// ---------------------------------------------------------------------------
+// PARTNER PROFIT SHARING
+// ---------------------------------------------------------------------------
+
+/// Versioned, effective-dated split. Percentages active on a given date must total 100.
+/// Never hardcode 50/50 — the seed writes an explicit pair of rows.
+model PartnerProfitShare {
+  id        String @id @default(uuid()) @db.Char(36)
+  companyId String @db.Char(36)
+  userId    String @db.Char(36)
+
+  /// 0.0000 – 100.0000
+  percentage Decimal @db.Decimal(7, 4)
+
+  effectiveFrom DateTime  @db.Date
+  effectiveTo   DateTime? @db.Date
+  note          String?   @db.VarChar(500)
+
+  createdById String? @db.Char(36)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user      User    @relation("ProfitShareUser", fields: [userId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation("ProfitShareCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@unique([companyId, userId, effectiveFrom])
+  @@index([companyId, effectiveFrom])
+  @@map("partner_profit_shares")
+}
+
+/// Money actually moved to a partner. Deliberately separate from the calculated share.
+model PartnerPayout {
+  id        String @id @default(uuid()) @db.Char(36)
+  companyId String @db.Char(36)
+  userId    String @db.Char(36)
+
+  amount   Decimal @db.Decimal(18, 4)
+  currency String  @db.Char(3)
+
+  payoutDate DateTime     @db.Date
+  status     PayoutStatus @default(PAID)
+  method     String?      @db.VarChar(80)
+  reference  String?      @db.VarChar(191)
+  notes      String?      @db.Text
+
+  /// Optional window this payout settles, for outstanding-distribution maths.
+  periodStart DateTime? @db.Date
+  periodEnd   DateTime? @db.Date
+
+  createdById String? @db.Char(36)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  partner   User    @relation("PayoutPartner", fields: [userId], references: [id], onDelete: Restrict)
+  createdBy User?   @relation("PayoutCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([companyId, payoutDate])
+  @@index([userId, payoutDate])
+  @@map("partner_payouts")
+}
+
+// ---------------------------------------------------------------------------
+// MULTI-CURRENCY
+// ---------------------------------------------------------------------------
+
+/// Explicit, auditable conversion process. No implicit currency mixing anywhere.
+model ExchangeRate {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String? @db.Char(36)
+
+  baseCurrency  String  @db.Char(3)
+  quoteCurrency String  @db.Char(3)
+  /// 1 baseCurrency = `rate` quoteCurrency
+  rate          Decimal @db.Decimal(18, 8)
+
+  effectiveDate DateTime @db.Date
+  source        String   @default("MANUAL") @db.VarChar(60)
+
+  createdAt DateTime @default(now())
+
+  company Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, baseCurrency, quoteCurrency, effectiveDate])
+  @@index([baseCurrency, quoteCurrency, effectiveDate])
+  @@map("exchange_rates")
+}
+
+// ---------------------------------------------------------------------------
+// OBSERVABILITY
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String? @db.Char(36)
+  /// Null for system-generated changes (webhook ingestion).
+  actorId   String? @db.Char(36)
+
+  action     String  @db.VarChar(80) // e.g. "transaction.create"
+  entityType String  @db.VarChar(60)
+  entityId   String? @db.VarChar(64)
+  summary    String? @db.VarChar(500)
+
+  beforeData Json?
+  afterData  Json?
+
+  ipAddress String? @db.VarChar(64)
+  userAgent String? @db.VarChar(255)
+
+  createdAt DateTime @default(now())
+
+  company Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  actor   User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, createdAt])
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@map("audit_logs")
+}
+
+model Notification {
+  id        String  @id @default(uuid()) @db.Char(36)
+  companyId String? @db.Char(36)
+  userId    String  @db.Char(36)
+
+  type  NotificationType
+  title String           @db.VarChar(191)
+  body  String?          @db.VarChar(500)
+  link  String?          @db.VarChar(512)
+
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  company Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([companyId, createdAt])
+  @@map("notifications")
+}

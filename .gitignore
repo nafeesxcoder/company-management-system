@@ -1,0 +1,66 @@
+# ---- Secrets -----------------------------------------------------------------
+# Never commit a real environment file. Only .env.example belongs in git.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.keystore
+*.jks
+google-services.json
+GoogleService-Info.plist
+
+# ---- Node --------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+
+# ---- Build output ------------------------------------------------------------
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# ---- Prisma ------------------------------------------------------------------
+# Generated client is reproducible from the schema; migrations ARE committed.
+backend/src/generated/
+
+# ---- Tests / coverage --------------------------------------------------------
+coverage/
+.nyc_output/
+test-results/
+
+# ---- Flutter / Dart ----------------------------------------------------------
+app/.dart_tool/
+app/.packages
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/build/
+app/ios/Pods/
+app/ios/.symlinks/
+app/ios/Flutter/Flutter.framework
+app/ios/Flutter/Flutter.podspec
+app/android/.gradle/
+app/android/local.properties
+app/android/key.properties
+app/android/app/debug/
+app/android/app/release/
+**/*.g.dart
+**/*.freezed.dart
+
+# ---- Editors / OS ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- Logs / uploads ----------------------------------------------------------
+logs/
+*.log
+uploads/
+tmp/

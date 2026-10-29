@@ -1,0 +1,55 @@
+name: company_management
+description: Company income, projects and partner profit — mobile client.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_riverpod: ^2.5.1
+
+  # Networking
+  dio: ^5.7.0
+
+  # Navigation
+  go_router: ^14.6.2
+
+  # Secure token storage — Keystore on Android, Keychain on iOS.
+  flutter_secure_storage: ^9.2.2
+
+  # Formatting (currency, dates) for the device locale.
+  intl: ^0.19.0
+
+  # Charts
+  fl_chart: ^0.69.2
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  mocktail: ^1.0.4
+
+# NOTE ON CODE GENERATION
+# -----------------------
+# Models are written by hand rather than with freezed/json_serializable.
+# The API returns every monetary value as a decimal STRING, and hand-written
+# `fromJson` makes that explicit and auditable at each field — there is no
+# generated converter that might quietly coerce an amount to a double.
+# It also means `flutter run` works immediately with no build_runner step.
+
+flutter:
+  uses-material-design: true
+  # No bundled assets yet — every icon in the app comes from Material Icons.
+  # Adding an image later means creating `assets/` AND re-adding:
+  #   assets:
+  #     - assets/
+  # Declaring a directory that does not exist fails `flutter pub get`, which is
+  # why the declaration is commented out rather than left pointing at nothing.
